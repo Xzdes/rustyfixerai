@@ -6,12 +6,13 @@ use serde::Deserialize;
 use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
 
-// Объявляем наши модули
+// Объявляем все наши модули
 mod modules;
 use modules::llm_interface::LLMInterface;
 use modules::web_agent::WebAgent;
+use modules::patch_engine::PatchEngine;
 
-// --- СТРУКТУРЫ ДЛЯ ПАРСИНГА JSON ОТ CARGO ---
+// --- СТРУКТURЫ ДЛЯ ПАРСИНГА JSON ОТ CARGO ---
 // Эти структуры должны быть полными, чтобы `serde` мог успешно
 // десериализовать JSON-ответы от `cargo build`.
 
@@ -34,11 +35,11 @@ struct ErrorCode {
     code: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Span {
     file_name: String,
     line_start: usize,
-    #[serde(default)] // Используем default, если поле отсутствует
+    #[serde(default)] // Используем default, если поле отсутствует, чтобы избежать ошибок парсинга
     suggested_replacement: Option<String>,
 }
 
@@ -60,14 +61,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("{}", format!("❌ Build failed. Found {} error(s).", build_errors.len()).red());
     
-    // Главный цикл обработки ошибок (пока обрабатываем только первую)
+    // Главный цикл обработки ошибок (обрабатываем только первую найденную ошибку)
     if let Some(first_error) = build_errors.first() {
+        // Извлекаем местоположение ошибки. Если его нет, мы не можем продолжить.
+        let (file_path, line_number) = if let Some(span) = first_error.spans.first() {
+            (span.file_name.clone(), span.line_start)
+        } else {
+            println!("{}", "Could not determine error location. Cannot proceed.".red());
+            return Ok(());
+        };
+
         println!("{}", "\n--- Analyzing First Error ---".bold().cyan());
         display_error_details(first_error);
 
         // --- ШАГ 2: АНАЛИЗ ОШИБКИ С ПОМОЩЬЮ LLM ---
-        let llm_spinner = create_spinner("Asking local LLM to analyze the error...");
         let llm = LLMInterface::new();
+        let llm_spinner = create_spinner("Asking local LLM to analyze the error...");
         let analysis_plan = llm.analyze_error(&first_error.message).await?;
         llm_spinner.finish_with_message("LLM analysis complete.");
 
@@ -80,18 +89,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let agent = WebAgent::new();
         let web_context = agent.investigate(&analysis_plan.search_keywords).await?;
         web_spinner.finish_with_message("Web Agent investigation complete.");
+
+        // --- ШАГ 4: ГЕНЕРАЦИЯ, ВЕРИФИКАЦИЯ И ПРИМЕНЕНИЕ ИСПРАВЛЕНИЯ ---
+        println!("{}", "\n--- Initiating Patch Engine ---".bold().cyan());
+        let patch_spinner = create_spinner("Generating and verifying a fix...");
         
-        if web_context.is_empty() {
-            println!("{}", "Web Agent could not find relevant context.".yellow());
-        } else {
-            println!("{}", "\n--- Collected Web Context (first 500 chars) ---".bold().cyan());
-            // Выводим только часть для краткости
-            let snippet: String = web_context.chars().take(500).collect();
-            println!("{}...", snippet);
+        let engine = PatchEngine::new(
+            &llm,
+            &first_error.message,
+            &file_path,
+            line_number,
+            &web_context,
+        );
+
+        match engine.run().await {
+            Ok(_) => {
+                patch_spinner.finish_with_message("Successfully applied a verified patch!");
+                println!("{}", "\n✅ Code fixed. Please try running `cargo build` again.".green().bold());
+            }
+            Err(e) => {
+                patch_spinner.finish_with_message("Failed to apply a fix.");
+                eprintln!("{}", format!("Error: {}", e).red());
+            }
         }
     }
-
-    println!("{}", "\n[NEXT STEP] Generating a code fix... (Implementation pending)".yellow());
 
     Ok(())
 }

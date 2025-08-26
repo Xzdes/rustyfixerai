@@ -2,7 +2,6 @@
 
 use reqwest::Client;
 use scraper::{Html, Selector};
-use url::Url;
 
 const SEARCH_ENGINE_URL: &str = "https://duckduckgo.com/html/?q=";
 const MAX_RESULTS_TO_VISIT: usize = 3; // Посетим первые 3 релевантные ссылки
@@ -45,6 +44,7 @@ impl WebAgent {
                     }
                 }
                 Err(e) => {
+                    // Используем eprintln для вывода ошибок, это стандартная практика
                     eprintln!("    -> Failed to scrape {}: {}", url, e);
                 }
             }
@@ -61,7 +61,7 @@ impl WebAgent {
         document.select(&selector)
             .filter_map(|element| element.value().attr("href"))
             .map(|s| s.to_string())
-            .filter(|url| !url.contains("duckduckgo.com")) // Исключаем рекламные ссылки
+            .filter(|url| !url.contains("duckduckgo.com")) // Исключаем рекламные и служебные ссылки
             .collect()
     }
 
@@ -70,30 +70,20 @@ impl WebAgent {
         let html = self.client.get(url).send().await?.text().await?;
         let document = Html::parse_document(&html);
 
-        // Удаляем "шумные" теги
-        let noisy_selectors = "nav, footer, header, aside, script, style, .sidebar, .ad, [role='navigation']";
-        let selector_to_remove = Selector::parse(noisy_selectors).unwrap();
-        
-        // Клонируем документ, чтобы работать с измененной версией
-        let mut clean_html_string = document.html();
-        let mut temp_doc = Html::parse_document(&clean_html_string);
-        
-        // Этот блок не работает как ожидалось из-за особенностей scraper,
-        // поэтому мы будем использовать более простой подход - извлечение текста.
-        
-        // Пробуем найти основной контент
+        // Пробуем найти основной контент в семантических тегах
         let main_content_selectors = "main, article, .post, .content, .entry-content";
         let main_selector = Selector::parse(main_content_selectors).unwrap();
         
         let main_text = if let Some(main_element) = document.select(&main_selector).next() {
             main_element.text().collect::<Vec<_>>().join(" ")
         } else {
-            // Если не нашли, берем текст из `body`
+            // Если не нашли, берем текст из `body` как запасной вариант
             let body_selector = Selector::parse("body").unwrap();
+            // .next().unwrap() здесь безопасен, т.к. у документа всегда есть body
             document.select(&body_selector).next().unwrap().text().collect::<Vec<_>>().join(" ")
         };
         
-        // Очищаем текст от лишних пробелов
+        // Очищаем текст от лишних пробелов и переносов строк
         Ok(main_text.split_whitespace().collect::<Vec<_>>().join(" "))
     }
 }

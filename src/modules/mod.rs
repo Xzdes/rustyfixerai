@@ -4,3 +4,4 @@
 // чтобы `main.rs` мог его найти и использовать через `use modules::llm_interface::...`
 pub mod llm_interface;
 pub mod web_agent;
+pub mod patch_engine;
