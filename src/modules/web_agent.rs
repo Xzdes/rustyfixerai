@@ -1,11 +1,12 @@
 // src/modules/web_agent.rs
 
+use super::llm_interface::AnalysisPlan;
 use reqwest::Client;
 use scraper::{Html, Selector};
 
 const SEARCH_ENGINE_URL: &str = "https://duckduckgo.com/html/?q=";
-const MAX_RESULTS_TO_VISIT: usize = 3; // Посетим первые 3 релевантные ссылки
-const MIN_CONTENT_LENGTH: usize = 300; // Минимальная длина контента для рассмотрения
+const MAX_RESULTS_TO_VISIT: usize = 3;
+const MIN_CONTENT_LENGTH: usize = 300;
 
 pub struct WebAgent {
     client: Client,
@@ -21,18 +22,35 @@ impl WebAgent {
         }
     }
 
-    /// Главный метод: ищет информацию и собирает релевантный контекст.
-    pub async fn investigate(&self, keywords: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let search_url = format!("{}{}", SEARCH_ENGINE_URL, keywords);
+    /// УЛУЧШЕННЫЙ метод: использует план для целенаправленного поиска.
+    pub async fn investigate(&self, plan: &AnalysisPlan) -> Result<String, Box<dyn std::error::Error>> {
+        let mut urls_to_visit = Vec::new();
+
+        // 1. Приоритетный поиск в документации, если крейт известен
+        if let Some(crate_name) = &plan.involved_crate {
+            println!("    -> Identified relevant crate: {}. Searching its documentation.", crate_name);
+            // Добавляем ссылки на официальные ресурсы
+            urls_to_visit.push(format!("https://docs.rs/{}", crate_name));
+            urls_to_visit.push(format!("https://crates.io/crates/{}", crate_name));
+        }
+
+        // 2. Общий поиск в интернете
+        let search_url = format!("{}{}", SEARCH_ENGINE_URL, &plan.search_keywords);
         let search_results_html = self.client.get(&search_url).send().await?.text().await?;
-        let urls = self.parse_search_results(&search_results_html);
+        let mut general_urls = self.parse_search_results(&search_results_html);
+        urls_to_visit.append(&mut general_urls);
         
+        // 3. Сбор контекста с посещением уникальных URL
         let mut collected_context = String::new();
         let mut visited_count = 0;
+        let mut visited_urls = std::collections::HashSet::new();
 
-        for url in urls {
+        for url in urls_to_visit {
             if visited_count >= MAX_RESULTS_TO_VISIT {
                 break;
+            }
+            if !visited_urls.insert(url.clone()) { // Пропускаем дубликаты
+                continue;
             }
             
             println!("    -> Visiting: {}", &url);
@@ -44,7 +62,6 @@ impl WebAgent {
                     }
                 }
                 Err(e) => {
-                    // Используем eprintln для вывода ошибок, это стандартная практика
                     eprintln!("    -> Failed to scrape {}: {}", url, e);
                 }
             }
@@ -61,7 +78,7 @@ impl WebAgent {
         document.select(&selector)
             .filter_map(|element| element.value().attr("href"))
             .map(|s| s.to_string())
-            .filter(|url| !url.contains("duckduckgo.com")) // Исключаем рекламные и служебные ссылки
+            .filter(|url| !url.contains("duckduckgo.com"))
             .collect()
     }
 
@@ -69,21 +86,17 @@ impl WebAgent {
     async fn scrape_url(&self, url: &str) -> Result<String, Box<dyn std::error::Error>> {
         let html = self.client.get(url).send().await?.text().await?;
         let document = Html::parse_document(&html);
-
-        // Пробуем найти основной контент в семантических тегах
-        let main_content_selectors = "main, article, .post, .content, .entry-content";
+        
+        let main_content_selectors = "main, article, .post, .content, .entry-content, .docs-main";
         let main_selector = Selector::parse(main_content_selectors).unwrap();
         
         let main_text = if let Some(main_element) = document.select(&main_selector).next() {
             main_element.text().collect::<Vec<_>>().join(" ")
         } else {
-            // Если не нашли, берем текст из `body` как запасной вариант
             let body_selector = Selector::parse("body").unwrap();
-            // .next().unwrap() здесь безопасен, т.к. у документа всегда есть body
             document.select(&body_selector).next().unwrap().text().collect::<Vec<_>>().join(" ")
         };
         
-        // Очищаем текст от лишних пробелов и переносов строк
         Ok(main_text.split_whitespace().collect::<Vec<_>>().join(" "))
     }
 }

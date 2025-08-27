@@ -2,11 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-// --- КОНФИГУРАЦИЯ ---
+// --- КОНФИГУРАЦІЯ ---
 const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
 const LLM_MODEL_NAME: &str = "llama3:8b";
 
-// --- СТРУКТУРЫ ДЛЯ OLLAMA API ---
+// --- СТРУКТУРИ ДЛЯ OLLAMA API ---
 
 #[derive(Serialize)]
 struct OllamaRequest<'a> {
@@ -32,12 +32,13 @@ struct ResponseMessage {
     content: String,
 }
 
-// --- СТРУКТУРА ДЛЯ НАШЕГО ПЛАНА ---
+// --- УЛУЧШЕННАЯ СТРУКТУРА ПЛАНА ---
 
 #[derive(Debug, Deserialize)]
 pub struct AnalysisPlan {
     pub error_summary: String,
     pub search_keywords: String,
+    pub involved_crate: Option<String>,
 }
 
 // --- ПУБЛИЧНАЯ СТРУКТУРА ИНТЕРФЕЙСА ---
@@ -53,31 +54,39 @@ impl LLMInterface {
         }
     }
 
-    /// Анализирует ошибку компилятора и возвращает план действий.
+    /// Анализирует ошибку компилятора и возвращает УЛУЧШЕННЫЙ план действий.
     pub async fn analyze_error(&self, error_message: &str) -> Result<AnalysisPlan, Box<dyn std::error::Error>> {
-        // --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-        // Мы добавили новое, очень явное правило №3.
         let prompt = format!(
-            r#"You are a Rust compiler expert. Your task is to analyze a compiler error message and create a concise plan for finding a solution.
+            r#"You are a Rust compiler expert. Your task is to analyze a compiler error and create a plan for finding a solution.
 
 **CRITICAL RULES:**
 1.  Summarize the error in one simple sentence.
-2.  Generate a set of 3-4 natural language search keywords.
-3.  **The "search_keywords" value MUST be a single string, with keywords separated by spaces.**
-4.  Your output MUST be a valid JSON object, and nothing else.
+2.  Generate a set of 3-4 natural language search keywords. The "search_keywords" value MUST be a single string.
+3.  **If the error message mentions a type or trait from an external crate (e.g., "the trait `serde::Deserialize` is not implemented for `MyStruct`"), identify the crate's name (e.g., "serde"). If not, set "involved_crate" to null.**
+4.  Your output MUST be a valid JSON object.
 
 **Compiler Error:**
 "{}"
 
 **Output Format:**
-Return ONLY a valid JSON object with the keys "error_summary" and "search_keywords".
+Return ONLY a valid JSON object with the keys "error_summary", "search_keywords", and "involved_crate".
 
-**Good Example:**
+**Good Example 1 (Crate involved):**
+Compiler Error: "the trait bound `MyStruct: Serialize` is not satisfied. the trait `Serialize` is not implemented for `MyStruct`"
+Your Output:
+{{
+  "error_summary": "A struct is missing the required 'Serialize' trait implementation.",
+  "search_keywords": "rust trait Serialize is not implemented for struct",
+  "involved_crate": "serde"
+}}
+
+**Good Example 2 (No crate involved):**
 Compiler Error: "cannot assign twice to immutable variable `x`"
 Your Output:
 {{
   "error_summary": "A variable was reassigned without being declared as mutable.",
-  "search_keywords": "rust cannot assign twice to immutable variable fix"
+  "search_keywords": "rust cannot assign twice to immutable variable fix",
+  "involved_crate": null
 }}
 "#,
             error_message
@@ -100,43 +109,40 @@ Your Output:
         }
 
         let ollama_response = res.json::<OllamaResponse>().await?;
-        
-        // Добавим отладочный вывод, чтобы видеть, что возвращает LLM
-        // println!("LLM Raw Response: {}", ollama_response.message.content);
-
         let plan: AnalysisPlan = serde_json::from_str(&ollama_response.message.content)?;
-
         Ok(plan)
     }
 
-    // --- МЕТОД ДЛЯ ГЕНЕРАЦИИ ИСПРАВЛЕНИЯ ---
-    pub async fn generate_fix(
+    // --- КАРДИНАЛЬНО НОВЫЙ МЕТОД ГЕНЕРАЦИИ ИСПРАВЛЕНИЯ ---
+    pub async fn generate_full_fix(
         &self,
         error_message: &str,
-        code_context: &str,
+        full_code: &str, // <-- Принимаем ВЕСЬ КОД
         web_context: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let prompt = format!(
-            r#"You are an expert Rust programmer. Your task is to fix a piece of Rust code based on the provided error and context.
+            r#"You are an expert Rust programmer. Your task is to fix a piece of Rust code.
 
 **CRITICAL RULES:**
-1.  Analyze the user's code, the compiler error, and the context from online sources.
-2.  Rewrite the single line of code that contains the error.
-3.  **Your output MUST BE ONLY the single, corrected line of Rust code.** Do not add explanations, markdown code blocks, or any other text.
+1.  You will be given the full source code of a file and a compiler error.
+2.  Your task is to fix the code to resolve the error. You might need to change a different line than the one reported in the error, or add/remove lines.
+3.  **Your output MUST BE ONLY the complete, corrected, full source code for the file.** Do not add explanations, markdown code blocks, or any other text. Just the raw, fixed code.
 
 --- COMPILER ERROR ---
 {}
 
---- USER'S CODE (Code around the error) ---
+--- FULL SOURCE CODE ---
+```rust
 {}
+```
 
---- CONTEXT FROM ONLINE SEARCH ---
+--- CONTEXT FROM ONLINE SEARCH (for your reference) ---
 {}
 
 ---
-Your Corrected Line of Code:
+Your Corrected Full Source Code:
 "#,
-            error_message, code_context, web_context
+            error_message, full_code, web_context
         );
         
         let request_payload = OllamaRequest {
@@ -156,6 +162,7 @@ Your Corrected Line of Code:
         }
 
         let ollama_response = res.json::<OllamaResponse>().await?;
+        // Очищаем потенциальные "обертки" от LLM
         let cleaned_fix = ollama_response.message.content
             .trim()
             .trim_start_matches("```rust")

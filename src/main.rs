@@ -5,6 +5,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 // Объявляем все наши модули
 mod modules;
@@ -12,17 +14,15 @@ use modules::llm_interface::LLMInterface;
 use modules::web_agent::WebAgent;
 use modules::patch_engine::PatchEngine;
 
-// --- СТРУКТURЫ ДЛЯ ПАРСИНГА JSON ОТ CARGO ---
-// Эти структуры должны быть полными, чтобы `serde` мог успешно
-// десериализовать JSON-ответы от `cargo build`.
+// --- СТРУКТУРЫ ДЛЯ ПАРСИНГА JSON ОТ CARGO ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct CargoMessage {
     reason: String,
     message: Option<CompilerMessage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct CompilerMessage {
     message: String,
     level: String,
@@ -30,7 +30,7 @@ struct CompilerMessage {
     spans: Vec<Span>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ErrorCode {
     code: String,
 }
@@ -39,7 +39,7 @@ struct ErrorCode {
 struct Span {
     file_name: String,
     line_start: usize,
-    #[serde(default)] // Используем default, если поле отсутствует, чтобы избежать ошибок парсинга
+    #[serde(default)]
     suggested_replacement: Option<String>,
 }
 
@@ -47,79 +47,86 @@ struct Span {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "🚀 RustyFixerAI v0.1.0 - Initializing...".bold().yellow());
+    println!("{}", "🚀 RustyFixerAI v0.4.0 - Full File Edit Mode".bold().yellow());
 
-    // --- ШАГ 1: ЗАПУСК СБОРКИ И ПОИСК ОШИБОК ---
-    let spinner = create_spinner("Running initial `cargo build`...");
-    let build_errors = run_cargo_build()?;
-    spinner.finish_and_clear();
+    let mut successful_fixes = 0;
+    const MAX_ITERATIONS: u32 = 10;
 
-    if build_errors.is_empty() {
-        println!("{}", "✅ Build successful! No errors to fix.".green());
-        return Ok(());
-    }
-    
-    println!("{}", format!("❌ Build failed. Found {} error(s).", build_errors.len()).red());
-    
-    // Главный цикл обработки ошибок (обрабатываем только первую найденную ошибку)
-    if let Some(first_error) = build_errors.first() {
-        // Извлекаем местоположение ошибки. Если его нет, мы не можем продолжить.
-        let (file_path, line_number) = if let Some(span) = first_error.spans.first() {
-            (span.file_name.clone(), span.line_start)
+    for i in 0..MAX_ITERATIONS {
+        println!("{}", format!("\n--- Iteration {} ---", i + 1).bold().blue());
+        let spinner = create_spinner("Running `cargo build` to find errors...");
+        let build_errors = run_cargo_build()?;
+        spinner.finish_and_clear();
+
+        if build_errors.is_empty() {
+            println!("{}", "✅ Build successful! No more errors to fix.".green().bold());
+            break;
+        }
+        
+        if i == MAX_ITERATIONS - 1 {
+            println!("{}", "Reached max iterations. Halting.".red().bold());
+            break;
+        }
+        
+        println!("{}", format!("❌ Build failed. Found {} error(s).", build_errors.len()).red());
+        
+        let first_error = build_errors.first().unwrap().clone();
+        
+        let file_path = if let Some(span) = first_error.spans.first() {
+            span.file_name.clone()
         } else {
-            println!("{}", "Could not determine error location. Cannot proceed.".red());
-            return Ok(());
+            println!("{}", "Could not determine error location. Halting.".red().bold());
+            break;
         };
 
-        println!("{}", "\n--- Analyzing First Error ---".bold().cyan());
-        display_error_details(first_error);
+        println!("{}", "--- Analyzing First Error (Top of the list) ---".bold().cyan());
+        display_error_details(&first_error);
 
-        // --- ШАГ 2: АНАЛИЗ ОШИБКИ С ПОМОЩЬЮ LLM ---
         let llm = LLMInterface::new();
-        let llm_spinner = create_spinner("Asking local LLM to analyze the error...");
+        let llm_spinner = create_spinner("Asking LLM for an action plan...");
         let analysis_plan = llm.analyze_error(&first_error.message).await?;
         llm_spinner.finish_with_message("LLM analysis complete.");
 
-        println!("{}", "\n--- Autonomous Action Plan ---".bold().cyan());
-        println!("- {}: {}", "Summary".bold(), analysis_plan.error_summary);
-        println!("- {}: {}", "Search Keywords".bold(), analysis_plan.search_keywords);
-
-        // --- ШАГ 3: СБОР КОНТЕКСТА ИЗ ИНТЕРНЕТА ---
-        let web_spinner = create_spinner("Deploying Web Agent to gather context...");
+        let web_spinner = create_spinner("Deploying Web Agent...");
         let agent = WebAgent::new();
-        let web_context = agent.investigate(&analysis_plan.search_keywords).await?;
+        let web_context = agent.investigate(&analysis_plan).await?;
         web_spinner.finish_with_message("Web Agent investigation complete.");
 
-        // --- ШАГ 4: ГЕНЕРАЦИЯ, ВЕРИФИКАЦИЯ И ПРИМЕНЕНИЕ ИСПРАВЛЕНИЯ ---
-        println!("{}", "\n--- Initiating Patch Engine ---".bold().cyan());
-        let patch_spinner = create_spinner("Generating and verifying a fix...");
+        let patch_spinner = create_spinner("Generating and verifying a new version of the file...");
         
+        // Вызываем новый конструктор PatchEngine без line_number
         let engine = PatchEngine::new(
             &llm,
             &first_error.message,
             &file_path,
-            line_number,
             &web_context,
         );
 
         match engine.run().await {
             Ok(_) => {
                 patch_spinner.finish_with_message("Successfully applied a verified patch!");
-                println!("{}", "\n✅ Code fixed. Please try running `cargo build` again.".green().bold());
+                successful_fixes += 1;
+                continue; 
             }
             Err(e) => {
                 patch_spinner.finish_with_message("Failed to apply a fix.");
                 eprintln!("{}", format!("Error: {}", e).red());
+                println!("{}", "Halting due to failed patch attempt.".red().bold());
+                break;
             }
         }
     }
+
+    println!("{}", "\n--- Session Report ---".bold().yellow());
+    println!("- Total fixes applied: {}", successful_fixes);
+    println!("----------------------");
 
     Ok(())
 }
 
 // --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-/// Запускает `cargo build` и возвращает вектор ошибок компиляции.
+/// Запускает `cargo build` и возвращает **полный и отсортированный** вектор ошибок.
 fn run_cargo_build() -> Result<Vec<CompilerMessage>, std::io::Error> {
     let mut child = Command::new("cargo")
         .arg("build")
@@ -128,32 +135,58 @@ fn run_cargo_build() -> Result<Vec<CompilerMessage>, std::io::Error> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let stdout = child.stdout.take().expect("Failed to open stdout");
-    let reader = BufReader::new(stdout);
-    let mut errors = Vec::new();
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let mut threads = Vec::new();
 
-    for line in reader.lines() {
-        if let Ok(line_content) = line {
-            // Пропускаем строки, которые не являются JSON-объектами
-            if !line_content.starts_with('{') {
-                continue;
-            }
-            if let Ok(msg) = serde_json::from_str::<CargoMessage>(&line_content) {
-                if msg.reason == "compiler-message" {
-                    if let Some(compiler_msg) = msg.message {
-                        if compiler_msg.level == "error" {
-                            errors.push(compiler_msg);
+    if let Some(stdout) = child.stdout.take() {
+        let errors_clone = Arc::clone(&errors);
+        threads.push(thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                if line.starts_with('{') {
+                    if let Ok(msg) = serde_json::from_str::<CargoMessage>(&line) {
+                        if msg.reason == "compiler-message" && msg.message.as_ref().map_or(false, |m| m.level == "error") {
+                            errors_clone.lock().unwrap().push(msg.message.unwrap());
                         }
                     }
                 }
             }
-        }
+        }));
     }
+
+    if let Some(stderr) = child.stderr.take() {
+        let errors_clone = Arc::clone(&errors);
+        threads.push(thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                if line.starts_with('{') {
+                    if let Ok(msg) = serde_json::from_str::<CargoMessage>(&line) {
+                        if msg.reason == "compiler-message" && msg.message.as_ref().map_or(false, |m| m.level == "error") {
+                            errors_clone.lock().unwrap().push(msg.message.unwrap());
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    for t in threads {
+        t.join().expect("Thread panicked");
+    }
+
     child.wait()?;
-    Ok(errors)
+
+    let final_errors_mutex = Arc::try_unwrap(errors).unwrap_or_default();
+    let mut final_errors = final_errors_mutex.into_inner().unwrap();
+    
+    final_errors.sort_by_key(|e| {
+        e.spans.first().map_or(usize::MAX, |s| s.line_start)
+    });
+    
+    Ok(final_errors)
 }
 
-/// Отображает детали ошибки в консоли в структурированном виде.
+/// Отображает детали ошибки в консоли.
 fn display_error_details(error: &CompilerMessage) {
     println!("- {}: {}", "Message".bold(), error.message);
     if let Some(code) = &error.code {
@@ -165,7 +198,7 @@ fn display_error_details(error: &CompilerMessage) {
     }
 }
 
-/// Создает и возвращает новый, стилизованный экземпляр спиннера.
+/// Создает и возвращает новый экземпляр спиннера.
 fn create_spinner(msg: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
     spinner.enable_steady_tick(std::time::Duration::from_millis(120));
