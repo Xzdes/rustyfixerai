@@ -37,7 +37,8 @@ struct ResponseMessage {
 #[derive(Debug, Deserialize)]
 pub struct AnalysisPlan {
     pub error_summary: String,
-    pub search_keywords: String,
+    // Теперь это вектор для множественных, разноплановых запросов
+    pub search_queries: Vec<String>, 
     pub involved_crate: Option<String>,
 }
 
@@ -61,32 +62,27 @@ impl LLMInterface {
 
 **CRITICAL RULES:**
 1.  Summarize the error in one simple sentence.
-2.  Generate a set of 3-4 natural language search keywords. The "search_keywords" value MUST be a single string.
-3.  **If the error message mentions a type or trait from an external crate (e.g., "the trait `serde::Deserialize` is not implemented for `MyStruct`"), identify the crate's name (e.g., "serde"). If not, set "involved_crate" to null.**
+2.  Generate a JSON array of 3 distinct, natural-language search queries a human would type to solve this. The queries should cover different angles of the problem.
+3.  If the error mentions an external crate, identify it. Otherwise, set "involved_crate" to null.
 4.  Your output MUST be a valid JSON object.
 
 **Compiler Error:**
 "{}"
 
 **Output Format:**
-Return ONLY a valid JSON object with the keys "error_summary", "search_keywords", and "involved_crate".
+Return ONLY a valid JSON object with the keys "error_summary", "search_queries" (as a string array), and "involved_crate".
 
-**Good Example 1 (Crate involved):**
-Compiler Error: "the trait bound `MyStruct: Serialize` is not satisfied. the trait `Serialize` is not implemented for `MyStruct`"
+**Good Example:**
+Compiler Error: "the trait bound `MyStruct: Serialize` is not satisfied"
 Your Output:
 {{
   "error_summary": "A struct is missing the required 'Serialize' trait implementation.",
-  "search_keywords": "rust trait Serialize is not implemented for struct",
+  "search_queries": [
+    "rust trait Serialize is not implemented for struct",
+    "how to derive Serialize for struct serde",
+    "serde Serialize custom implementation example"
+  ],
   "involved_crate": "serde"
-}}
-
-**Good Example 2 (No crate involved):**
-Compiler Error: "cannot assign twice to immutable variable `x`"
-Your Output:
-{{
-  "error_summary": "A variable was reassigned without being declared as mutable.",
-  "search_keywords": "rust cannot assign twice to immutable variable fix",
-  "involved_crate": null
 }}
 "#,
             error_message
@@ -109,15 +105,15 @@ Your Output:
         }
 
         let ollama_response = res.json::<OllamaResponse>().await?;
-        let plan: AnalysisPlan = serde_json::from_str(&ollama_response.message.content)?;
-        Ok(plan)
+        let analysis_plan: AnalysisPlan = serde_json::from_str(&ollama_response.message.content)?;
+        Ok(analysis_plan)
     }
 
-    // --- КАРДИНАЛЬНО НОВЫЙ МЕТОД ГЕНЕРАЦИИ ИСПРАВЛЕНИЯ ---
+    // Метод для генерации полной исправленной версии файла
     pub async fn generate_full_fix(
         &self,
         error_message: &str,
-        full_code: &str, // <-- Принимаем ВЕСЬ КОД
+        full_code: &str,
         web_context: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let prompt = format!(
@@ -162,7 +158,6 @@ Your Corrected Full Source Code:
         }
 
         let ollama_response = res.json::<OllamaResponse>().await?;
-        // Очищаем потенциальные "обертки" от LLM
         let cleaned_fix = ollama_response.message.content
             .trim()
             .trim_start_matches("```rust")
