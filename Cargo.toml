@@ -1,6 +1,6 @@
 [package]
 name = "rusty-fixer-ai"
-version = "1.0.0" # <-- Прыгаем сразу на 1.0.0
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
