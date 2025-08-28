@@ -3,11 +3,12 @@
 use super::llm_interface::AnalysisPlan;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use anyhow::Result; // ИСПРАВЛЕНИЕ
 
 // Увеличиваем лимиты, чтобы быть более настойчивыми в поиске
-const MAX_RESULTS_PER_QUERY: usize = 5; // Сколько ссылок брать с одной страницы поисковика
-const MAX_TOTAL_SITES_TO_VISIT: usize = 5; // Общий лимит на количество посещаемых сайтов
-const MIN_CONTENT_LENGTH: usize = 200; // Минимальная длина контента, чтобы считать его полезным
+const MAX_RESULTS_PER_QUERY: usize = 5;
+const MAX_TOTAL_SITES_TO_VISIT: usize = 5;
+const MIN_CONTENT_LENGTH: usize = 200;
 
 pub struct WebAgent {
     client: Client,
@@ -24,19 +25,17 @@ impl WebAgent {
     }
 
     /// УЛУЧШЕННЫЙ метод: использует план для выполнения нескольких поисковых запросов.
-    pub async fn investigate(&self, plan: &AnalysisPlan) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn investigate(&self, plan: &AnalysisPlan) -> Result<String> { // ИСПРАВЛЕНИЕ
         let mut all_urls = Vec::new();
 
-        // 1. Приоритетный поиск в документации, если ИИ определил связанный крейт
         if let Some(crate_name) = &plan.involved_crate {
             println!("    -> Identified relevant crate: {}. Prioritizing its documentation.", crate_name);
             all_urls.push(format!("https://docs.rs/{}", crate_name));
         }
 
-        // 2. Выполняем ВСЕ поисковые запросы, сгенерированные ИИ
         for query in &plan.search_queries {
             println!("    -> Executing search query: \"{}\"", query);
-            let search_url = format!("https://duckduckgo.com/html/?q={}", query);
+            let search_url = format!("https://duckduckgo.com/html/?q={}", urlencoding::encode(query));
             match self.client.get(&search_url).send().await {
                 Ok(res) => {
                     let html = res.text().await?;
@@ -47,7 +46,6 @@ impl WebAgent {
             }
         }
         
-        // 3. Сбор контекста с посещением уникальных URL
         let mut collected_context = String::new();
         let mut visited_count = 0;
         let mut visited_urls = std::collections::HashSet::new();
@@ -56,7 +54,6 @@ impl WebAgent {
             if visited_count >= MAX_TOTAL_SITES_TO_VISIT {
                 break;
             }
-            // Пропускаем дубликаты, чтобы не посещать один и тот же сайт дважды
             if !visited_urls.insert(url.clone()) { 
                 continue;
             }
@@ -91,18 +88,16 @@ impl WebAgent {
             .collect()
     }
 
-    /// УЛУЧШЕННЫЙ СКРАПЕР с приоритетным извлечением блоков кода ("охота за кодом").
-    async fn scrape_url(&self, url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    /// УЛУЧШЕННЫЙ СКРАПЕР с приоритетным извлечением блоков кода.
+    async fn scrape_url(&self, url: &str) -> Result<String> { // ИСПРАВЛЕНИЕ
         let html = self.client.get(url).send().await?.text().await?;
         let document = Html::parse_document(&html);
         
         let mut content = String::new();
 
-        // Приоритет №1: Ищем и извлекаем все блоки кода
         let code_selector = Selector::parse("pre, code").unwrap();
         for code_block in document.select(&code_selector) {
             let code_text = code_block.text().collect::<String>();
-            // Добавляем только непустые блоки кода
             if !code_text.trim().is_empty() {
                 content.push_str("Relevant Code Example:\n```rust\n");
                 content.push_str(&code_text);
@@ -110,14 +105,12 @@ impl WebAgent {
             }
         }
 
-        // Приоритет №2: Ищем основной текстовый контент
         let main_content_selectors = "main, article, .post, .content, .entry-content, .docs-main, .answer";
         let main_selector = Selector::parse(main_content_selectors).unwrap();
         
         let main_text = if let Some(main_element) = document.select(&main_selector).next() {
             main_element.text().collect::<Vec<_>>().join(" ")
         } else {
-            // Запасной вариант - взять все из body
             let body_selector = Selector::parse("body").unwrap();
             document.select(&body_selector).next().unwrap().text().collect::<Vec<_>>().join(" ")
         };

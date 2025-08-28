@@ -1,10 +1,22 @@
 // src/modules/patch_engine.rs
 
+use crate::{CargoMessage, CompilerMessage};
 use super::llm_interface::LLMInterface;
 use super::knowledge_cache::KnowledgeCache;
 use std::path::Path;
 use tokio::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use anyhow::{Result, Context, bail};
+use walkdir::WalkDir;
+use tempfile;
+use std::io::{BufReader, BufRead};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+pub enum VerificationResult {
+    Success,
+    Failure(String),
+}
 
 pub struct PatchEngine<'a> {
     llm: &'a LLMInterface,
@@ -29,129 +41,153 @@ impl<'a> PatchEngine<'a> {
         Self { llm, cache, error_signature, error_message, file_path, web_context, no_cache }
     }
 
-    /// Главный метод: ищет в кэше, генерирует, верифицирует и применяет исправление.
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run_and_self_correct(&self) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 2;
         let original_code = fs::read_to_string(self.file_path).await?;
-        let mut suggested_full_code = String::new();
+        let mut last_error = self.error_message.to_string();
 
-        // 1. Сначала ищем решение в локальном кэше
+        for attempt in 1..=MAX_ATTEMPTS {
+            println!("    -> Fix attempt {} of {}", attempt, MAX_ATTEMPTS);
+            let suggested_full_code = self.generate_code_suggestion(&original_code, &last_error).await?;
+
+            match self.verify_fix(&suggested_full_code).await {
+                Ok(VerificationResult::Success) => {
+                    println!("    -> Verification successful!");
+                    if !self.no_cache && self.cache.lookup(&self.error_signature)?.is_none() {
+                        self.cache.store(&self.error_signature, &suggested_full_code)?;
+                        println!("    -> Stored new successful solution in the knowledge cache.");
+                    }
+                    fs::write(self.file_path, suggested_full_code).await?;
+                    return Ok(());
+                }
+                Ok(VerificationResult::Failure(new_error)) => {
+                    let first_line = new_error.lines().next().unwrap_or("Unknown verification error").to_string();
+                    println!("    -> Verification failed. New error: {}", first_line);
+                    if attempt < MAX_ATTEMPTS {
+                        println!("    -> Attempting self-correction...");
+                        last_error = new_error;
+                    } else {
+                        bail!("Fix failed after {} attempts. Last error: {}", MAX_ATTEMPTS, first_line);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        bail!("Could not find a working solution.")
+    }
+
+    async fn generate_code_suggestion(&self, original_code: &str, error_message: &str) -> Result<String> {
         if !self.no_cache {
             if let Some(cached_solution) = self.cache.lookup(&self.error_signature)? {
                 println!("    -> Found a potential solution in the knowledge cache.");
-                suggested_full_code = self.apply_patch(&original_code, &cached_solution);
+                return Ok(cached_solution);
             }
         }
-
-        // 2. Если в кэше нет, генерируем новое решение с помощью LLM
-        if suggested_full_code.is_empty() {
-            println!("    -> No solution in cache. Asking LLM to generate a new version of the file.");
-            suggested_full_code = self.llm.generate_full_fix(
-                self.error_message,
-                &original_code,
-                self.web_context,
-            ).await?;
-        }
-
-        // 3. Верифицируем предложенный код
-        if self.verify_fix(&suggested_full_code).await? {
-            // 4. Сохраняем успешное решение в кэш (если оно было сгенерировано, а не из кэша)
-            if !self.no_cache && self.cache.lookup(&self.error_signature)?.is_none() {
-                let patch = self.create_patch(&original_code, &suggested_full_code);
-                self.cache.store(&self.error_signature, &patch)?;
-                println!("    -> Stored new successful solution in the knowledge cache.");
-            }
-            
-            // 5. Применяем исправление (перезаписываем оригинальный файл)
-            fs::write(self.file_path, suggested_full_code).await?;
-            Ok(())
-        } else {
-            Err("Generated fix failed verification.".into())
-        }
+        println!("    -> No solution in cache. Asking LLM to generate a new version.");
+        self.llm.generate_full_fix(error_message, original_code, self.web_context).await
     }
-
-    /// Проверяет, компилируется ли проект после полной замены файла.
-    async fn verify_fix(&self, full_code: &str) -> Result<bool, std::io::Error> {
-        let temp_dir = std::env::temp_dir();
-        let temp_project_path = temp_dir.join("rusty-fixer-temp-project");
-
-        if temp_project_path.exists() {
-            fs::remove_dir_all(&temp_project_path).await?;
-        }
-        copy_dir_all(".", &temp_project_path).await?;
+    
+    async fn verify_fix(&self, full_code: &str) -> Result<VerificationResult> {
+        let temp_dir = tempfile::Builder::new().prefix("rusty-fixer-code-").tempdir()?;
+        copy_dir_all(".", temp_dir.path()).await.context("Failed to copy project to temp dir")?;
         
-        let target_path_in_temp = temp_project_path.join(self.file_path);
+        let target_path_in_temp = temp_dir.path().join(self.file_path);
         fs::write(&target_path_in_temp, full_code).await?;
 
-        let output = Command::new("cargo")
-            .arg("check")
-            .current_dir(&temp_project_path)
-            .output()?;
-
-        if !output.status.success() {
-            println!("    -> Verification failed. New error:");
-            let error_output = String::from_utf8_lossy(&output.stderr);
-            println!("{}", error_output.lines().take(15).collect::<Vec<_>>().join("\n"));
-        }
-
-        fs::remove_dir_all(&temp_project_path).await?;
-        
-        Ok(output.status.success())
-    }
-
-    /// Создает diff-патч между оригинальным и исправленным кодом.
-    fn create_patch(&self, original: &str, modified: &str) -> String {
-        let patch = diff::lines(original, modified);
-        let mut patch_str = String::new();
-        for diff_result in patch {
-            match diff_result {
-                diff::Result::Left(l) => patch_str.push_str(&format!("-{}\n", l)),
-                diff::Result::Right(r) => patch_str.push_str(&format!("+{}\n", r)),
-                diff::Result::Both(b, _) => patch_str.push_str(&format!(" {}\n", b)),
+        let run_cargo = |cmd: &str| -> Result<(bool, Vec<CompilerMessage>)> {
+            let mut child = Command::new("cargo")
+                .arg(cmd)
+                .arg("--message-format=json")
+                .current_dir(temp_dir.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            
+            let messages = Arc::new(Mutex::new(Vec::new()));
+            let mut threads = Vec::new();
+            
+            let messages_clone_out = Arc::clone(&messages);
+            if let Some(stdout) = child.stdout.take() {
+                threads.push(thread::spawn(move || {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines().flatten() {
+                        if let Ok(msg) = serde_json::from_str::<CargoMessage>(&line) {
+                        if msg.reason == "compiler-message" {
+                            if let Some(compiler_msg) = msg.message {
+                                messages_clone_out.lock().unwrap().push(compiler_msg);
+                            }
+                        }
+                        }
+                    }
+                }));
             }
-        }
-        patch_str
-    }
 
-    /// Применяет diff-патч к оригинальному коду, чтобы восстановить исправленную версию.
-    fn apply_patch(&self, original: &str, patch_str: &str) -> String {
-        let mut new_lines = Vec::new();
-        let original_lines: Vec<&str> = original.lines().collect();
-        let mut original_idx = 0;
-
-        for patch_line in patch_str.lines() {
-            if patch_line.starts_with('+') {
-                new_lines.push(&patch_line[1..]);
-            } else if patch_line.starts_with(' ') {
-                if original_idx < original_lines.len() {
-                    new_lines.push(original_lines[original_idx]);
-                    original_idx += 1;
-                }
-            } else if patch_line.starts_with('-') {
-                original_idx += 1;
+            let messages_clone_err = Arc::clone(&messages);
+            if let Some(stderr) = child.stderr.take() {
+                threads.push(thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().flatten() {
+                        if let Ok(msg) = serde_json::from_str::<CargoMessage>(&line) {
+                        if msg.reason == "compiler-message" {
+                            if let Some(compiler_msg) = msg.message {
+                                messages_clone_err.lock().unwrap().push(compiler_msg);
+                            }
+                        }
+                        }
+                    }
+                }));
             }
+
+            for t in threads {
+                t.join().unwrap();
+            }
+            let status = child.wait()?;
+            let all_messages = Arc::try_unwrap(messages).unwrap().into_inner().unwrap();
+            Ok((status.success(), all_messages))
+        };
+
+        // 1. Запускаем `cargo check`
+        let (check_success, check_messages) = run_cargo("check")?;
+        if !check_success {
+            let first_error = check_messages
+                .iter()
+                .find(|m| m.level == "error")
+                .map(|m| m.message.clone())
+                .unwrap_or_else(|| "Unknown check error".to_string());
+            return Ok(VerificationResult::Failure(first_error));
         }
-        new_lines.join("\n")
+
+        // 2. Если check прошел, запускаем `cargo test`
+        println!("    -> `cargo check` passed. Now running tests...");
+        let (_, test_messages) = run_cargo("test")?;
+        let test_errors: Vec<_> = test_messages.iter().filter(|m| m.level == "error").collect();
+            
+        if !test_errors.is_empty() {
+             let first_error = test_errors.first().unwrap().message.clone();
+             return Ok(VerificationResult::Failure(first_error));
+        }
+
+        Ok(VerificationResult::Success)
     }
 }
 
-/// Вспомогательная функция для рекурсивного копирования директорий.
 async fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
     fs::create_dir_all(&dst).await?;
-    let mut entries = fs::read_dir(src).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let ty = entry.file_type().await?;
-        let entry_path = entry.path();
-        
-        if let Some(file_name) = entry_path.file_name() {
-            if file_name == "target" || file_name.to_string_lossy().starts_with('.') {
-                continue;
-            }
-        }
+    for entry in WalkDir::new(src.as_ref())
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| !e.path().to_string_lossy().contains("target") && !e.path().to_string_lossy().contains(".git"))
+    {
+        let relative_path = entry.path().strip_prefix(src.as_ref()).unwrap();
+        let dst_file_path = dst.as_ref().join(relative_path);
 
-        if ty.is_dir() {
-            Box::pin(copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))).await?;
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dst_file_path).await?;
         } else {
-            fs::copy(entry.path(), dst.as_ref().join(entry.file_name())).await?;
+            if let Some(parent) = dst_file_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::copy(entry.path(), &dst_file_path).await?;
         }
     }
     Ok(())

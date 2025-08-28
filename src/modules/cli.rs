@@ -2,30 +2,29 @@
 
 use clap::Parser;
 
-/// RustyFixerAI: Автономный AI-ассистент для исправления ошибок компиляции Rust.
+/// RustyFixerAI: An autonomous AI assistant to fix Rust compilation errors.
 ///
-/// Запустите эту команду в корневой директории вашего Rust-проекта,
-/// чтобы автоматически найти, проанализировать и исправить ошибки сборки.
+/// Run this command in the root of your Rust project to automatically
+/// find, analyze, and fix build errors.
 #[derive(Parser, Debug)]
-#[command(version = "1.0.0", author = "Your Name", about, long_about = None)]
+#[command(version = "2.0.0", author = "Your Name", about, long_about = None)]
 pub struct CliArgs {
-    /// Включает дополнительный проход для исправления предупреждений (warnings)
-    /// после того, как все критические ошибки (errors) были устранены.
+    /// Enables an additional pass to fix warnings after all errors are resolved.
     #[arg(long, default_value_t = false)]
     pub fix_warnings: bool,
 
-    /// Заставляет агента игнорировать локальный кэш знаний и всегда
-    /// выполнять поиск в интернете. Полезно для получения самых свежих решений.
+    /// Forces the agent to ignore the local knowledge cache and always
+    /// search online for solutions. Useful for getting the freshest fixes.
     #[arg(long, default_value_t = false)]
     pub no_cache: bool,
 
-    /// [ПОКА НЕ РЕАЛИЗОВАНО] Запускает инструмент в режиме наблюдения,
-    /// автоматически исправляя ошибки при каждом сохранении файла.
+    /// [NOT IMPLEMENTED] Runs the tool in watch mode, automatically
+    /// fixing errors on every file save.
     #[arg(long, default_value_t = false)]
     pub watch: bool,
 }
 
-/// Парсит аргументы командной строки при запуске приложения.
+/// Parses command line arguments on application startup.
 pub fn parse_args() -> CliArgs {
     CliArgs::parse()
 }

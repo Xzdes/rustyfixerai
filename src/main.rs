@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use anyhow::Result;
 
 // Объявляем все наши модули
 mod modules;
@@ -15,60 +16,65 @@ use modules::knowledge_cache::KnowledgeCache;
 use modules::llm_interface::LLMInterface;
 use modules::web_agent::WebAgent;
 use modules::patch_engine::PatchEngine;
+use modules::issue_detector::{self, IssueClassification};
+use modules::cargo_expert::CargoExpert;
+use modules::project_analyzer::ProjectAnalyzer;
 
 // --- СТРУКТУРЫ ДЛЯ ПАРСИНГА JSON ОТ CARGO ---
 
 #[derive(Debug, Deserialize, Clone)]
-struct CargoMessage {
-    reason: String,
-    message: Option<CompilerMessage>,
+pub struct CargoMessage {
+    pub reason: String,
+    pub message: Option<CompilerMessage>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct CompilerMessage {
-    message: String,
-    level: String,
-    code: Option<ErrorCode>,
-    spans: Vec<Span>,
+pub struct CompilerMessage {
+    pub message: String,
+    pub level: String,
+    pub code: Option<ErrorCode>,
+    pub spans: Vec<Span>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct ErrorCode {
-    code: String,
+pub struct ErrorCode {
+    pub code: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct Span {
-    file_name: String,
-    line_start: usize,
+pub struct Span {
+    pub file_name: String,
+    pub line_start: usize,
     #[serde(default)]
-    suggested_replacement: Option<String>,
+    pub suggested_replacement: Option<String>,
 }
 
 // --- ОСНОВНАЯ ЛОГИКА ПРИЛОЖЕНИЯ ---
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let args: CliArgs = parse_args();
-    println!("{}", "🚀 RustyFixerAI v1.0.0 - Grand Plan Edition".bold().yellow());
+    println!("{}", "🚀 RustyFixerAI v2.0.0 - Final Version".bold().yellow());
 
-    // Инициализируем кэш знаний
+    // Инициализируем все наши инструменты и экспертов
     let cache = KnowledgeCache::new()?;
     let llm = LLMInterface::new();
-    let agent = WebAgent::new();
+    let web_agent = WebAgent::new();
+    let project_analyzer = ProjectAnalyzer::new();
+    let cargo_expert = CargoExpert::new(&llm);
 
     let mut session_report = SessionReport::new();
     const MAX_ITERATIONS: u32 = 10;
 
-    // --- ГЛАВНЫЙ ИТЕРАТИВНЫЙ ЦИКЛ ДЛЯ ОШИБОК ---
-    println!("{}", "\n--- Phase 1: Fixing Errors ---".bold().magenta());
+    // --- ГЛАВНЫЙ ИТЕРАТИВНЫЙ ЦИКЛ ИСПРАВЛЕНИЙ ---
+    println!("{}", "\n--- Phase 1: Fixing Build Issues ---".bold().magenta());
     for i in 0..MAX_ITERATIONS {
-        let spinner = create_spinner("Running `cargo build` to find errors...");
+        let spinner = create_spinner("Running `cargo build` to find issues...");
         let (errors, warnings) = run_cargo_build()?;
         spinner.finish_and_clear();
 
         if errors.is_empty() {
-            println!("{}", "✅ No more errors to fix.".green());
+            println!("{}", "✅ No more errors to fix. Build successful!".green());
             session_report.remaining_warnings = warnings.len();
             break;
         }
@@ -80,45 +86,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         println!("{}", format!("❌ Build failed. Found {} error(s).", errors.len()).red());
         
-        let issue_to_fix = errors.first().unwrap().clone();
-        if !process_issue(&issue_to_fix, &llm, &agent, &cache, &args).await? {
-            break; // Прерываемся, если исправление не удалось
+        let issue_to_fix = match issue_detector::prioritize_and_classify(&errors) {
+            Some(issue) => issue,
+            None => {
+                println!("{}", "Could not identify a priority issue.".yellow());
+                break;
+            }
+        };
+
+        // --- ВЫЗОВ СООТВЕТСТВУЮЩЕГО ЭКСПЕРТА ---
+        let fix_successful = match issue_to_fix.classification {
+            IssueClassification::Code => {
+                process_code_issue(&issue_to_fix.message, &llm, &web_agent, &cache, &project_analyzer, &args).await?
+            }
+            IssueClassification::CargoManifest => {
+                match cargo_expert.fix_manifest_issue(&issue_to_fix.message).await {
+                    Ok(_) => {
+                        session_report.manifest_fixed += 1;
+                        true
+                    },
+                    Err(e) => {
+                        eprintln!("{}", format!("Cargo Expert failed: {}", e).red());
+                        false
+                    }
+                }
+            }
+            _ => {
+                println!("Don't know how to handle this issue type yet. Halting.");
+                false
+            }
+        };
+        
+        if !fix_successful {
+            println!("{}", "Halting due to a failed fix attempt.".red().bold());
+            break;
         }
-        session_report.errors_fixed += 1;
-    }
 
-    // --- ОПЦИОНАЛЬНЫЙ ЦИКЛ ДЛЯ ПРЕДУПРЕЖДЕНИЙ ---
-    if args.fix_warnings && session_report.remaining_warnings > 0 {
-        println!("{}", "\n--- Phase 2: Fixing Warnings ---".bold().magenta());
-        for i in 0..MAX_ITERATIONS {
-            let spinner = create_spinner("Running `cargo build` to find warnings...");
-            let (_, warnings) = run_cargo_build()?;
-            spinner.finish_and_clear();
-
-            if warnings.is_empty() {
-                println!("{}", "✅ No more warnings to fix.".green());
-                break;
-            }
-
-            if i == MAX_ITERATIONS - 1 {
-                println!("{}", "Reached max iterations for warnings. Halting.".red().bold());
-                break;
-            }
-
-            println!("{}", format!("Found {} warning(s).", warnings.len()).yellow());
-            
-            let issue_to_fix = warnings.first().unwrap().clone();
-            if !process_issue(&issue_to_fix, &llm, &agent, &cache, &args).await? {
-                break;
-            }
-            session_report.warnings_fixed += 1;
+        if issue_to_fix.classification == IssueClassification::Code {
+             session_report.errors_fixed += 1;
         }
     }
-
 
     // --- ФИНАЛЬНЫЙ ОТЧЕТ ---
     println!("{}", "\n--- Session Report ---".bold().yellow());
-    println!("- Errors fixed: {}", session_report.errors_fixed);
+    println!("- Code errors fixed: {}", session_report.errors_fixed);
+    println!("- Cargo.toml issues fixed: {}", session_report.manifest_fixed);
     if args.fix_warnings {
         println!("- Warnings fixed: {}", session_report.warnings_fixed);
     }
@@ -127,25 +139,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Обрабатывает одну проблему (ошибку или предупреждение).
-/// Возвращает `Ok(true)`, если исправление прошло успешно, `Ok(false)` если нет.
-async fn process_issue(
+/// Обрабатывает ошибку в коде.
+async fn process_code_issue(
     issue: &CompilerMessage,
     llm: &LLMInterface,
     agent: &WebAgent,
     cache: &KnowledgeCache,
+    _analyzer: &ProjectAnalyzer,
     args: &CliArgs,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool> {
     let file_path = if let Some(span) = issue.spans.first() {
         span.file_name.clone()
     } else {
         println!("{}", "Could not determine issue location. Skipping.".yellow());
-        return Ok(true); // Пропускаем, но не прерываем цикл
+        return Ok(true);
     };
 
-    println!("{}", "\n--- Analyzing Top Issue ---".bold().cyan());
+    println!("{}", "\n--- Analyzing Code Issue ---".bold().cyan());
     display_issue_details(issue);
-
+    
     let llm_spinner = create_spinner("Asking LLM for an action plan...");
     let analysis_plan = llm.analyze_error(&issue.message).await?;
     llm_spinner.finish_with_message("LLM analysis complete.");
@@ -161,7 +173,7 @@ async fn process_issue(
 
     let engine = PatchEngine::new(llm, cache, error_signature, &issue.message, &file_path, &web_context, args.no_cache);
 
-    match engine.run().await {
+    match engine.run_and_self_correct().await {
         Ok(_) => {
             patch_spinner.finish_with_message("Successfully applied a verified patch!");
             Ok(true)
@@ -169,13 +181,11 @@ async fn process_issue(
         Err(e) => {
             patch_spinner.finish_with_message("Failed to apply a fix.");
             eprintln!("{}", format!("Error: {}", e).red());
-            println!("{}", "Halting due to failed patch attempt.".red().bold());
             Ok(false)
         }
     }
 }
 
-/// Запускает `cargo build` и возвращает **полный и отсортированный** вектор ошибок и предупреждений.
 fn run_cargo_build() -> Result<(Vec<CompilerMessage>, Vec<CompilerMessage>), std::io::Error> {
     let mut child = Command::new("cargo")
         .arg("build")
@@ -240,7 +250,6 @@ fn run_cargo_build() -> Result<(Vec<CompilerMessage>, Vec<CompilerMessage>), std
     Ok((errors, warnings))
 }
 
-/// Отображает детали проблемы (ошибки/предупреждения) в консоли.
 fn display_issue_details(issue: &CompilerMessage) {
     let level_colored = if issue.level == "error" {
         issue.level.to_uppercase().red().bold()
@@ -259,7 +268,6 @@ fn display_issue_details(issue: &CompilerMessage) {
     }
 }
 
-/// Создает и возвращает новый экземпляр спиннера.
 fn create_spinner(msg: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
     spinner.enable_steady_tick(std::time::Duration::from_millis(120));
@@ -272,14 +280,14 @@ fn create_spinner(msg: &str) -> ProgressBar {
     spinner
 }
 
-/// Структура для сбора статистики за сессию.
 struct SessionReport {
     errors_fixed: usize,
     warnings_fixed: usize,
+    manifest_fixed: usize,
     remaining_warnings: usize,
 }
 impl SessionReport {
     fn new() -> Self {
-        Self { errors_fixed: 0, warnings_fixed: 0, remaining_warnings: 0 }
+        Self { errors_fixed: 0, warnings_fixed: 0, manifest_fixed: 0, remaining_warnings: 0 }
     }
 }
