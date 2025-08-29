@@ -1,7 +1,8 @@
 // src/modules/llm_interface.rs
 
 use serde::{Deserialize, Serialize};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context}; // <-- ИСПРАВЛЕНИЕ ЗДЕСЬ
+use std::fmt::Debug;
 
 // --- CONFIGURATION ---
 const OLLAMA_API_URL: &str = "http://127.0.0.1:11434/api/chat";
@@ -33,13 +34,11 @@ struct ResponseMessage {
     content: String,
 }
 
-#[derive(Deserialize)]
-struct OllamaTomlFixResponse {
-    cargo_toml: String,
+#[derive(Deserialize, Debug)]
+pub struct OllamaCargoSuggestion {
+    pub crate_name: String,
+    pub dependency_line: String,
 }
-
-
-// --- ANALYSIS PLAN STRUCTURE ---
 
 #[derive(Debug, Deserialize)]
 pub struct AnalysisPlan {
@@ -47,8 +46,6 @@ pub struct AnalysisPlan {
     pub search_queries: Vec<String>,
     pub involved_crate: Option<String>,
 }
-
-// --- PUBLIC INTERFACE STRUCTURE ---
 
 pub struct LLMInterface {
     client: reqwest::Client,
@@ -60,6 +57,62 @@ impl LLMInterface {
             client: reqwest::Client::new(),
         }
     }
+
+    /// Внутренний метод для отправки запроса в Ollama.
+    async fn make_ollama_request(&self, prompt: &str, format: &str) -> Result<String> {
+        let request_payload = OllamaRequest {
+            model: LLM_MODEL_NAME,
+            messages: vec![Message { role: "user", content: prompt }],
+            stream: false,
+            format,
+        };
+
+        let res = self.client.post(OLLAMA_API_URL)
+            .json(&request_payload)
+            .send()
+            .await
+            .context("Failed to send request to Ollama")?;
+
+        if !res.status().is_success() {
+            return Err(anyhow!("Ollama API request failed with status {}", res.status()));
+        }
+
+        let ollama_response = res.json::<OllamaResponse>().await.context("Failed to parse Ollama response shell")?;
+        Ok(ollama_response.message.content)
+    }
+
+    /// **КЛЮЧЕВОЙ НОВЫЙ МЕТОД** с логикой самоочистки.
+    async fn send_request_and_extract_json<T: for<'de> Deserialize<'de> + Debug>(
+        &self,
+        initial_prompt: &str,
+    ) -> Result<T> {
+        // --- ШАГ 1: Первая попытка получить ответ ---
+        let raw_response = self.make_ollama_request(initial_prompt, "json").await?;
+
+        // --- Оптимистичный путь: если ответ уже чистый JSON, парсим его ---
+        if let Ok(parsed) = serde_json::from_str::<T>(&raw_response) {
+            return Ok(parsed);
+        }
+
+        // --- ШАГ 2: Если парсинг не удался, запускаем самоочистку ---
+        println!("    -> LLM response was not clean JSON. Attempting self-extraction...");
+        let extraction_prompt = format!(
+            "Extract only the valid JSON object from the following text. Do not add any explanation, conversational text, or markdown. Only the JSON object itself.\n\nTEXT:\n---\n{}\n---",
+            raw_response
+        );
+        
+        let cleaner_response = self.make_ollama_request(&extraction_prompt, "json").await?;
+
+        // --- Финальная попытка распарсить очищенный ответ ---
+        serde_json::from_str::<T>(&cleaner_response).map_err(|e| {
+            anyhow!(
+                "Failed to parse JSON even after self-extraction.\nError: {}\nOriginal Response: '{}'\nCleaned Response: '{}'",
+                e, raw_response, cleaner_response
+            )
+        })
+    }
+    
+    // --- ПУБЛИЧНЫЕ МЕТОДЫ ТЕПЕРЬ ИСПОЛЬЗУЮТ НАДЕЖНЫЙ `send_request_and_extract_json` ---
 
     pub async fn analyze_error(&self, error_message: &str) -> Result<AnalysisPlan> {
         let prompt = format!(
@@ -75,26 +128,7 @@ impl LLMInterface {
 Return ONLY a valid JSON object with the keys "error_summary", "search_queries", and "involved_crate"."#,
             error_message
         );
-
-        let request_payload = OllamaRequest {
-            model: LLM_MODEL_NAME,
-            messages: vec![Message { role: "user", content: &prompt }],
-            stream: false,
-            format: "json",
-        };
-
-        let res = self.client.post(OLLAMA_API_URL)
-            .json(&request_payload)
-            .send()
-            .await?;
-
-        if !res.status().is_success() {
-            return Err(anyhow!("Ollama API request failed with status {}", res.status()));
-        }
-
-        let ollama_response = res.json::<OllamaResponse>().await?;
-        let analysis_plan: AnalysisPlan = serde_json::from_str(&ollama_response.message.content)?;
-        Ok(analysis_plan)
+        self.send_request_and_extract_json(&prompt).await
     }
 
     pub async fn generate_full_fix(
@@ -122,24 +156,10 @@ Your Corrected Full Source Code:"#,
             error_message, full_code, web_context
         );
         
-        let request_payload = OllamaRequest {
-            model: LLM_MODEL_NAME,
-            messages: vec![Message { role: "user", content: &prompt }],
-            stream: false,
-            format: "", 
-        };
-
-        let res = self.client.post(OLLAMA_API_URL)
-            .json(&request_payload)
-            .send()
-            .await?;
-
-        if !res.status().is_success() {
-            return Err(anyhow!("Ollama API request failed with status {}", res.status()));
-        }
-
-        let ollama_response = res.json::<OllamaResponse>().await?;
-        let cleaned_fix = ollama_response.message.content
+        let raw_fix = self.make_ollama_request(&prompt, "").await?;
+        
+        // Очистка от markdown для обычного текста все еще нужна
+        let cleaned_fix = raw_fix
             .trim()
             .trim_start_matches("```rust")
             .trim_start_matches("```")
@@ -149,56 +169,30 @@ Your Corrected Full Source Code:"#,
             
         Ok(cleaned_fix)
     }
-
+    
     pub async fn generate_cargo_fix(
         &self,
         error_message: &str,
-        cargo_toml_content: &str,
-    ) -> Result<String> {
+    ) -> Result<OllamaCargoSuggestion> {
         let prompt = format!(
-            r#"You are a Cargo.toml expert. A Rust project failed with an error.
-**TASK:** Analyze the error and the `Cargo.toml`. Add the missing dependency required to fix the error.
+            r#"You are a Cargo.toml expert. A Rust project failed with an error message about a missing crate.
+**TASK:** Identify the missing crate and suggest how to add it to Cargo.toml.
 **CRITICAL RULES:**
-1.  Identify the missing crate from the error message.
-2.  Add the dependency to the `[dependencies]` section. Use a common version like "1.0" or "0.12". If the error mentions a feature (like "derive" for serde), add that feature.
-3.  Your output MUST be a valid JSON object with a single key "cargo_toml" containing the complete, corrected TOML file as a string.
+1.  Your output MUST be a valid JSON object.
+2.  The JSON must have two keys: `crate_name` (the name of the crate, e.g., "serde") and `dependency_line` (the full line to add to Cargo.toml, e.g., "serde = {{ version = \"1.0\", features = [\"derive\"] }}").
+3.  Do NOT add any explanation. ONLY the JSON object.
 
 --- COMPILER ERROR ---
 {}
 
---- CURRENT Cargo.toml CONTENT ---
-```toml
-{}
-```
-
 --- JSON OUTPUT EXAMPLE ---
 {{
-  "cargo_toml": "[package]\nname = \"...\"\n...\n[dependencies]\nserde = {{ version = \"1.0\", features = [\"derive\"] }}\n..."
+  "crate_name": "serde",
+  "dependency_line": "serde = {{ version = \"1.0\", features = [\"derive\"] }}"
 }}
 "#,
-            error_message, cargo_toml_content
+            error_message
         );
-
-        let request_payload = OllamaRequest {
-            model: LLM_MODEL_NAME,
-            messages: vec![Message { role: "user", content: &prompt }],
-            stream: false,
-            format: "json",
-        };
-
-        let res = self.client.post(OLLAMA_API_URL)
-            .json(&request_payload)
-            .send()
-            .await?;
-
-        if !res.status().is_success() {
-            return Err(anyhow!("Ollama API request failed with status {}", res.status()));
-        }
-
-        let ollama_response = res.json::<OllamaResponse>().await?;
-        let fix_data: OllamaTomlFixResponse = serde_json::from_str(&ollama_response.message.content)
-            .map_err(|e| anyhow!("Failed to parse LLM JSON response for Cargo.toml fix: {}", e))?;
-            
-        Ok(fix_data.cargo_toml)
+        self.send_request_and_extract_json(&prompt).await
     }
 }

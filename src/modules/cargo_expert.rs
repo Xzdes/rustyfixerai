@@ -11,6 +11,8 @@ use tempfile;
 use tokio::fs;
 use walkdir::WalkDir;
 use std::path::Path;
+// --- НУЖНЫЕ ИМПОРТЫ ---
+use toml_edit::{DocumentMut, Item};
 
 pub struct CargoExpert<'a> {
     llm: &'a LLMInterface,
@@ -24,24 +26,45 @@ impl<'a> CargoExpert<'a> {
     pub async fn fix_manifest_issue(&self, issue: &CompilerMessage) -> Result<()> {
         println!("    -> Detected a potential Cargo.toml issue. Engaging Cargo Expert.");
         
+        let suggestion = self.llm.generate_cargo_fix(&issue.message).await?;
+        
+        println!(
+            "    -> LLM suggested adding the following dependency: `{}`", 
+            suggestion.dependency_line
+        );
+
         let cargo_toml_path = "Cargo.toml";
         let original_content = fs::read_to_string(cargo_toml_path)
             .await
             .context("Failed to read Cargo.toml")?;
+            
+        let mut doc = original_content.parse::<DocumentMut>()
+            .context("Failed to parse Cargo.toml")?;
 
-        let suggested_content = self.llm.generate_cargo_fix(&issue.message, &original_content).await?;
+        if let Some(deps) = doc["dependencies"].as_table_mut() {
+            // --- ГЛАВНОЕ И ОКОНЧАТЕЛЬНОЕ ИСПРАВЛЕНИЕ ---
+            // Мы можем распарсить строку зависимости напрямую в Item!
+            // Это самый прямой и надежный способ.
+            let dep_item = suggestion.dependency_line.parse::<Item>()
+                .context(format!("LLM returned an invalid dependency line: {}", suggestion.dependency_line))?;
+            
+            deps.insert(&suggestion.crate_name, dep_item);
+            // --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+        } else {
+            anyhow::bail!("Could not find [dependencies] table in Cargo.toml");
+        }
         
-        println!("    -> LLM suggested the following change for Cargo.toml:\n---\n{}\n---", suggested_content);
+        let new_content = doc.to_string();
 
-        if suggested_content.trim() == original_content.trim() {
-            println!("    -> LLM suggested no changes to Cargo.toml. Assuming it's a code issue instead.");
+        if new_content.trim() == original_content.trim() {
+            println!("    -> No effective changes were made to Cargo.toml. Skipping.");
             return Ok(());
         }
-
+        
         println!("    -> Verifying the suggested Cargo.toml changes...");
-        if self.verify_fix(&suggested_content, &issue.message).await? {
+        if self.verify_fix(&new_content, &issue.message).await? {
             println!("    -> Verification successful! Applying changes to Cargo.toml.");
-            fs::write(cargo_toml_path, suggested_content).await?;
+            fs::write(cargo_toml_path, new_content).await?;
         } else {
             anyhow::bail!("Suggested Cargo.toml changes failed verification: the original issue was not resolved.");
         }
@@ -63,7 +86,6 @@ impl<'a> CargoExpert<'a> {
             fs::remove_file(temp_lock_path).await?;
         }
 
-        // --- НАДЕЖНЫЙ СБОР ОШИБОК ИЗ ОБОИХ ПОТОКОВ ---
         let mut child = Command::new("cargo")
             .arg("check")
             .arg("--message-format=json")
@@ -115,12 +137,10 @@ impl<'a> CargoExpert<'a> {
         let all_messages = Arc::try_unwrap(messages).unwrap().into_inner().unwrap();
         let new_errors: Vec<CompilerMessage> = all_messages.into_iter().filter(|m| m.level == "error").collect();
         
-        // ----------------------------------------------------
-
         if new_errors.is_empty() {
             return Ok(true);
         }
-
+        
         let original_error_still_exists = new_errors
             .iter()
             .any(|e| e.message.contains(original_error_message));

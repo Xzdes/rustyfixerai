@@ -3,7 +3,7 @@
 use super::llm_interface::AnalysisPlan;
 use reqwest::Client;
 use scraper::{Html, Selector};
-use anyhow::Result; // ИСПРАВЛЕНИЕ
+use anyhow::Result;
 
 // Увеличиваем лимиты, чтобы быть более настойчивыми в поиске
 const MAX_RESULTS_PER_QUERY: usize = 5;
@@ -25,7 +25,7 @@ impl WebAgent {
     }
 
     /// УЛУЧШЕННЫЙ метод: использует план для выполнения нескольких поисковых запросов.
-    pub async fn investigate(&self, plan: &AnalysisPlan) -> Result<String> { // ИСПРАВЛЕНИЕ
+    pub async fn investigate(&self, plan: &AnalysisPlan) -> Result<String> {
         let mut all_urls = Vec::new();
 
         if let Some(crate_name) = &plan.involved_crate {
@@ -89,7 +89,7 @@ impl WebAgent {
     }
 
     /// УЛУЧШЕННЫЙ СКРАПЕР с приоритетным извлечением блоков кода.
-    async fn scrape_url(&self, url: &str) -> Result<String> { // ИСПРАВЛЕНИЕ
+    async fn scrape_url(&self, url: &str) -> Result<String> {
         let html = self.client.get(url).send().await?.text().await?;
         let document = Html::parse_document(&html);
         
