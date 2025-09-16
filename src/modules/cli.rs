@@ -1,5 +1,3 @@
-// src/modules/cli.rs
-
 use clap::Parser;
 
 /// RustyFixerAI: An autonomous AI assistant to fix Rust compilation errors.
@@ -7,7 +5,7 @@ use clap::Parser;
 /// Run this command in the root of your Rust project to automatically
 /// find, analyze, and fix build errors.
 #[derive(Parser, Debug)]
-#[command(version = "2.0.0", author = "Your Name", about, long_about = None)]
+#[command(version = "2.0.0", author = "You", about, long_about = None)]
 pub struct CliArgs {
     /// Enables an additional pass to fix warnings after all errors are resolved.
     #[arg(long, default_value_t = false)]
@@ -18,13 +16,11 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub no_cache: bool,
 
-    /// [NOT IMPLEMENTED] Runs the tool in watch mode, automatically
-    /// fixing errors on every file save.
+    /// [NOT IMPLEMENTED] Runs the tool in watch mode, automatically fixing on save.
     #[arg(long, default_value_t = false)]
     pub watch: bool,
 }
 
-/// Parses command line arguments on application startup.
 pub fn parse_args() -> CliArgs {
     CliArgs::parse()
 }
