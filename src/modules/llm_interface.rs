@@ -29,6 +29,7 @@ pub struct LLMInterface {
 #[derive(Debug, Deserialize)]
 struct OllamaChatResponse {
     message: OllamaMessage,
+    // другие поля, которые Ollama может прислать, нам не мешают (serde их игнорирует)
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,13 +51,15 @@ impl LLMInterface {
     }
 
     async fn chat(&self, prompt: &str, format: &str) -> Result<String> {
-        // format == "json" → пытаемся попросить модель отвечать JSON-ом
+        // ВАЖНО: отключаем streaming, иначе Ollama вернёт несколько JSON-объектов подряд
+        // и парсер получит "trailing characters".
         let url = format!("{}/api/chat", self.base_url);
         let body = serde_json::json!({
           "model": self.model,
           "messages": [{"role":"user", "content": prompt}],
           "options": { "temperature": 0.2 },
-          "format": if format.is_empty() { serde_json::Value::Null } else { serde_json::json!(format) }
+          "format": if format.is_empty() { serde_json::Value::Null } else { serde_json::json!(format) },
+          "stream": false
         });
 
         let res = self.http_async.post(&url).json(&body).send().await?;

@@ -6,3 +6,4 @@ pub mod cli;
 pub mod issue_detector;
 pub mod project_analyzer;
 pub mod cargo_expert;
+pub mod quick_fixes;

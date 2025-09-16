@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 pub enum VerificationResult {
     Success,
-    Failure(String),
+    Failure(String), // подробное сообщение об ошибке верификации
 }
 
 pub struct PatchEngine<'a> {
@@ -40,7 +40,7 @@ impl<'a> PatchEngine<'a> {
     }
 
     pub async fn run_and_self_correct(&self) -> Result<()> {
-        const MAX_ATTEMPTS: u32 = 2;
+        const MAX_ATTEMPTS: u32 = 3;
 
         // 1) Читаем исходник
         let original_code = fs::read_to_string(self.file_path).await
@@ -49,21 +49,26 @@ impl<'a> PatchEngine<'a> {
         // 2) Если есть валидный кэш — используем
         if !self.no_cache {
             if let Some(cached) = self.cache.lookup(&self.error_signature)? {
-                if self.verify_in_temp(&cached, self.error_message).await? {
-                    fs::write(self.file_path, cached).await?;
-                    println!("    -> Applied solution from local knowledge cache.");
-                    return Ok(());
+                match self.verify_fix(&cached).await? {
+                    VerificationResult::Success => {
+                        fs::write(self.file_path, cached).await?;
+                        println!("    -> Applied solution from local knowledge cache.");
+                        return Ok(());
+                    }
+                    VerificationResult::Failure(msg) => {
+                        println!("    -> Cached solution failed verification: {}", first_line(&msg));
+                    }
                 }
             }
         }
 
-        // 3) Генерация фикса + до 2 самокоррекций
-        let mut last_error = self.error_message.to_string();
+        // 3) Генерация фикса + самокоррекции на основе подробной ошибки
+        let mut last_error_context = self.error_message.to_string();
         for attempt in 1..=MAX_ATTEMPTS {
             println!("    -> Fix attempt {} of {}", attempt, MAX_ATTEMPTS);
-            let suggestion = self.generate_code_suggestion(&original_code, &last_error).await?;
-            match self.verify_fix(&suggestion).await {
-                Ok(VerificationResult::Success) => {
+            let suggestion = self.generate_code_suggestion(&original_code, &last_error_context).await?;
+            match self.verify_fix(&suggestion).await? {
+                VerificationResult::Success => {
                     println!("    -> Verification successful!");
                     if !self.no_cache {
                         self.cache.store(&self.error_signature, &suggestion)?;
@@ -71,32 +76,34 @@ impl<'a> PatchEngine<'a> {
                     fs::write(self.file_path, suggestion).await?;
                     return Ok(());
                 }
-                Ok(VerificationResult::Failure(new_err)) => {
-                    let head = new_err.lines().next().unwrap_or("Unknown verification error").to_string();
-                    println!("    -> Verification failed: {}", head);
+                VerificationResult::Failure(new_err) => {
+                    println!("    -> Verification failed: {}", first_line(&new_err));
                     if attempt < MAX_ATTEMPTS {
-                        println!("    -> Attempting self-correction...");
-                        last_error = new_err;
+                        println!("    -> Attempting self-correction with fresh error context...");
+                        last_error_context = new_err;
                     } else {
                         bail!("Fix failed after {} attempts.", MAX_ATTEMPTS);
                     }
                 }
-                Err(e) => bail!("Verification errored: {e:#}"),
             }
         }
         Ok(())
     }
 
-    async fn generate_code_suggestion(&self, original_code: &str, error: &str) -> Result<String> {
-        self.llm.generate_full_fix(error, original_code, self.web_context).await
+    async fn generate_code_suggestion(&self, original_code: &str, error_context: &str) -> Result<String> {
+        // Передаем ВЕСЬ контекст ошибки (последний провал проверки), чтобы LLM чётко понимал расхождение типов и место
+        self.llm.generate_full_fix(error_context, original_code, self.web_context).await
     }
 
     async fn verify_fix(&self, new_code: &str) -> Result<VerificationResult> {
-        self.verify_in_temp(new_code, self.error_message).await
-            .map(|ok| if ok { VerificationResult::Success } else { VerificationResult::Failure("Unknown".into()) })
+        match self.verify_in_temp(new_code).await? {
+            None => Ok(VerificationResult::Success),
+            Some(err) => Ok(VerificationResult::Failure(err)),
+        }
     }
 
-    async fn verify_in_temp(&self, new_code: &str, original_error_message: &str) -> Result<bool> {
+    /// Возвращает None, если всё ок; иначе Some(подробное сообщение об ошибке)
+    async fn verify_in_temp(&self, new_code: &str) -> Result<Option<String>> {
         // Создаём временную копию репозитория и запускаем там проверки
         let temp = TempDir::new().context("Failed to create temp dir")?;
         copy_dir_all(".", temp.path()).await?;
@@ -106,7 +113,8 @@ impl<'a> PatchEngine<'a> {
         if let Some(parent) = dst_file.parent() { fs::create_dir_all(parent).await.ok(); }
         fs::write(&dst_file, new_code).await?;
 
-        let run_cargo = |what: &str| -> Result<(bool, Vec<CompilerMessage>)> {
+        // Общий раннер cargo c парсингом ошибок
+        let mut collect_first_error = |what: &str| -> Result<Option<String>> {
             let mut child = Command::new("cargo")
                 .current_dir(temp.path())
                 .args([what, "--message-format=json"])
@@ -151,31 +159,51 @@ impl<'a> PatchEngine<'a> {
             }
 
             for t in threads { t.join().unwrap(); }
-            let status = child.wait()?;
+            let _status = child.wait()?;
             let all = Arc::try_unwrap(messages).unwrap().into_inner().unwrap();
-            Ok((status.success(), all))
+
+            // выбираем ПЕРВУЮ ошибку и формируем понятный текст
+            let mut errors: Vec<CompilerMessage> = all.into_iter().filter(|m| m.level == "error").collect();
+            if errors.is_empty() {
+                return Ok(None);
+            }
+            // отсортируем по строке первого спана
+            errors.sort_by_key(|m| m.spans.first().map_or(usize::MAX, |s| s.line_start));
+            let e = &errors[0];
+            let loc = e.spans.first().map(|s| format!("{}:{}",
+                s.file_name.replace('/', std::path::MAIN_SEPARATOR_STR),
+                s.line_start
+            )).unwrap_or_else(|| "<unknown>".into());
+            let code = e.code.as_ref().map(|c| format!(" [{}]", c.code)).unwrap_or_default();
+            let msg = format!("{}{} at {}\n{}", e.message, code, loc, stringify_spans(e));
+            Ok(Some(msg))
         };
 
         // 1) cargo check
-        let (check_ok, check_msgs) = run_cargo("check")?;
-        if !check_ok {
-            let first_err = check_msgs.iter()
-                .find(|m| m.level == "error")
-                .map(|m| m.message.clone())
-                .unwrap_or_else(|| "Unknown check error".to_string());
-            return Ok(!first_err.contains(original_error_message));
+        if let Some(err) = collect_first_error("check")? {
+            return Ok(Some(err));
         }
 
-        // 2) cargo test
-        let (_test_ok, test_msgs) = run_cargo("test")?;
-        let test_errors: Vec<_> = test_msgs.iter().filter(|m| m.level == "error").collect();
-        if !test_errors.is_empty() {
-            let first = test_errors.first().unwrap().message.clone();
-            return Ok(!first.contains(original_error_message));
+        // 2) cargo test (если тесты падают — это тоже контекст для LLM)
+        if let Some(err) = collect_first_error("test")? {
+            return Ok(Some(err));
         }
 
-        Ok(true)
+        Ok(None)
     }
+}
+
+fn stringify_spans(e: &CompilerMessage) -> String {
+    let mut out = String::new();
+    for s in &e.spans {
+        out.push_str(&format!(
+            "- at {}:{}{}\n",
+            s.file_name.replace('/', std::path::MAIN_SEPARATOR_STR),
+            s.line_start,
+            s.suggested_replacement.as_ref().map(|r| format!(" (suggested: {})", r)).unwrap_or_default()
+        ));
+    }
+    out
 }
 
 async fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
@@ -193,8 +221,12 @@ async fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::
             fs::create_dir_all(&dst_path).await?;
         } else {
             if let Some(parent) = dst_path.parent() { fs::create_dir_all(parent).await?; }
-            fs::copy(entry.path(), &dst_path).await?;
+            tokio::fs::copy(entry.path(), &dst_path).await?;
         }
     }
     Ok(())
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or(s).to_string()
 }

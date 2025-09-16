@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use anyhow::{Result, Context};
+use std::path::{Path, PathBuf};
 
 mod modules;
 use modules::cli::{CliArgs, parse_args};
@@ -16,6 +17,7 @@ use modules::patch_engine::PatchEngine;
 use modules::issue_detector::{self, IssueClassification};
 use modules::cargo_expert::CargoExpert;
 use modules::project_analyzer::ProjectAnalyzer;
+use modules::quick_fixes;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CargoMessage {
@@ -65,7 +67,7 @@ async fn main() -> Result<()> {
             println!("{}", "✅ No errors found.".green().bold());
             if args.fix_warnings && !warnings.is_empty() {
                 println!("{}", "⚠️ Fix-warnings pass enabled".yellow().bold());
-                // Здесь можно добавить отдельный проход фиксов ворнингов (по аналогии с ошибками)
+                // TODO: pass for warnings
             }
             break;
         }
@@ -80,9 +82,36 @@ async fn main() -> Result<()> {
 
         match issue.classification {
             IssueClassification::CargoManifest => {
-                if let Err(e) = cargo_expert.fix_manifest_issue(&issue.message).await {
-                    eprintln!("{} {e:#}", "Cargo manifest fix failed:".red().bold());
+                // 1) Файл, где всплыла ошибка
+                let Some(span) = issue.message.spans.first() else {
+                    eprintln!("{}", "Compiler message has no spans; skipping.".red());
                     break;
+                };
+                let target_file = PathBuf::from(&span.file_name);
+
+                // 2) Ищем корректный Cargo.toml для этого файла (не workspace-virtual)
+                let manifest_rel = find_nearest_package_manifest(&target_file)
+                    .context("Failed to find a package Cargo.toml for the affected file")?;
+
+                // 3) Пытаемся поправить Cargo.toml именно по этому пути
+                let manifest_applied = match cargo_expert
+                    .fix_manifest_issue_at(&issue.message, &manifest_rel)
+                    .await
+                {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        eprintln!("{} {e:#}", "Cargo manifest fix failed:".red().bold());
+                        false
+                    }
+                };
+
+                // 4) Если фикса манифеста нет и это derive по serde — сделаем быстрый кодовый импорт
+                if !manifest_applied {
+                    let msg = issue.message.message.to_lowercase();
+                    let derives = msg.contains("derive macro `serialize`") || msg.contains("derive macro `deserialize`");
+                    if derives {
+                        let _ = quick_fixes::ensure_serde_import(&span.file_name).await?;
+                    }
                 }
             }
             IssueClassification::Code | IssueClassification::Unknown => {
@@ -211,4 +240,46 @@ fn create_spinner(msg: &str) -> ProgressBar {
     );
     spinner.set_message(msg.to_string());
     spinner
+}
+
+/// Ищет ближайший *пакетный* Cargo.toml, поднимаясь от файла вверх.
+/// Пропускает «виртуальные» манифесты, где только [workspace].
+fn find_nearest_package_manifest(start_file: &Path) -> Result<String> {
+    let mut dir = start_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("No parent dir for file {}", start_file.display()))?;
+
+    let cwd = std::env::current_dir()?;
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.exists() {
+            let content = std::fs::read_to_string(&candidate)?;
+            let is_package = content.contains("[package]");
+            if is_package {
+                // отдаём относительный путь (от текущего каталога)
+                if let Ok(rel) = candidate.strip_prefix(&cwd) {
+                    return Ok(rel.to_string_lossy().to_string());
+                } else {
+                    return Ok(candidate.to_string_lossy().to_string());
+                }
+            }
+            // если это workspace-only манифест — поднимаемся выше
+        }
+        dir = match dir.parent() {
+            Some(p) => p,
+            None => break,
+        };
+    }
+    // как крайний случай — корневой Cargo.toml, если он пакетный
+    let root = cwd.join("Cargo.toml");
+    if root.exists() {
+        let content = std::fs::read_to_string(&root)?;
+        if content.contains("[package]") {
+            return Ok("Cargo.toml".to_string());
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Could not find a package Cargo.toml upwards from {}",
+        start_file.display()
+    ))
 }
